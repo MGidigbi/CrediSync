@@ -274,4 +274,117 @@
   )
 )
 
+;; --------------------------------------------------------------------------
+;; AI Assessment & Issuance Feature
+;; --------------------------------------------------------------------------
+
+;; assess-and-issue-loan-eligibility
+;; This function simulates an AI-agent decision process.
+;; It pulls the user's profile, calculates a dynamic risk score based on
+;; the current model weights, applies a market risk factor, and determines
+;; exact loan terms (approved amount, interest rate).
+;; It is designed to be the final decision gate before a loan is technically "issued".
+
+(define-public (assess-and-issue-loan-eligibility (requested-amount uint))
+  (let
+    (
+      (borrower tx-sender)
+      (profile (unwrap! (map-get? borrower-profiles borrower) err-unknown-borrower))
+      (collateral (get collateral profile))
+      (history (get history-score profile))
+      (repayments (get repayment-count profile))
+      (defaults (get default-count profile))
+      (has-active-loan (is-some (get active-loan-id profile)))
+      
+      ;; Calculate Base Score using new enhanced logic
+      (raw-score (calculate-enhanced-score collateral history repayments defaults))
+      (threshold (var-get risk-threshold))
+      (market-factor (var-get market-risk-factor))
+    )
+    (asserts! (check-not-paused) err-paused)
+    (asserts! (not has-active-loan) err-loan-already-active)
+
+    ;; 25+ lines logic block for eligibility assessment
+    (if (>= raw-score threshold)
+      (let 
+        (
+            ;; Calculate verified risk score adjusting for market conditions
+            (adjusted-score 
+                (if (> market-factor u10) 
+                    (if (> raw-score u10) (- raw-score u10) u0)
+                    raw-score
+                )
+            )
+            ;; Determine interest rate based on risk tiers
+            ;; High score (>80) = Low Rate (2%)
+            ;; Med score (>60) = Med Rate (5%)
+            ;; Low score (>Threshold) = High Rate (8%)
+            (interest-rate 
+                (if (> adjusted-score u80) 
+                    u2
+                    (if (> adjusted-score u60) u5 u8)
+                )
+            )
+            ;; Calculate max loanable amount based on collateral and risk
+            ;; simpler model: max-loan = collateral * (score / 100)
+            (max-loan (/ (* collateral adjusted-score) u100))
+            
+            ;; Determine Loan Duration based on score (Better score = Longer duration)
+            (duration 
+                (if (> adjusted-score u75)
+                    u1000 ;; ~1 week blocks
+                    u500  ;; ~3.5 days blocks
+                )
+            )
+        )
+        ;; Check if requested amount is safe
+        (if (<= requested-amount max-loan)
+            (let 
+                (
+                    ;; Automatically create/issue the loan if approved
+                    (new-loan-id (create-loan borrower requested-amount interest-rate duration))
+                )
+                ;; Update profile with new active loan
+                (map-set borrower-profiles borrower 
+                    (merge profile { active-loan-id: (some new-loan-id) })
+                )
+                
+                (ok {
+                    status: "APPROVED",
+                    loan-id: new-loan-id,
+                    risk-score: adjusted-score,
+                    interest-rate-percent: interest-rate,
+                    approved-amount: requested-amount,
+                    duration-blocks: duration,
+                    market-risk-adjustment: market-factor,
+                    reason: ""
+                })
+            )
+            (ok {
+                status: "PARTIAL_APPROVAL",
+                loan-id: u0, ;; No loan issued
+                risk-score: adjusted-score,
+                interest-rate-percent: interest-rate,
+                approved-amount: max-loan,
+                duration-blocks: u0,
+                market-risk-adjustment: market-factor,
+                reason: "Requested amount exceeds risk-adjusted limit"
+            })
+        )
+      )
+      ;; Failure case
+      (ok {
+        status: "REJECTED",
+        loan-id: u0,
+        risk-score: raw-score,
+        interest-rate-percent: u0,
+        approved-amount: u0,
+        duration-blocks: u0,
+        market-risk-adjustment: market-factor,
+        reason: "Credit score below risk threshold"
+      })
+    )
+  )
+)
+
 
